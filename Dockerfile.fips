@@ -1,0 +1,52 @@
+# FIPS build of the openproject-operator.
+#
+# WHY A SECOND DOCKERFILE. The default Dockerfile builds golang:1.23.8 ->
+# gcr.io/distroless/static:nonroot, which is not FIPS. The image running in the FedRAMP
+# boundary (shrapk2/openproject-operator:v0.3.4-fips) is a Chainguard FIPS build that
+# cannot be reproduced from this repository - there is no `fips` string in it, no 0.3.4,
+# and that image carries no provenance labels at all. This file closes that gap: the FIPS
+# image becomes reproducible from source.
+#
+# TWO STAGES ON PURPOSE. The deployed image ships 182 packages including binutils,
+# busybox and libexpat1 - the shape of a single-stage build that keeps the compiler
+# toolchain as its runtime. That accounts for 26 of its 58 HIGH/CRITICAL findings.
+# Building to `static` drops those to zero rather than patching them.
+#
+#   deployed v0.3.4-fips        58 CVEs (3 CRITICAL / 55 HIGH)   26 os-pkgs, 32 go
+#   this file, source as-is     13 CVEs (1 CRITICAL / 12 HIGH)    0 os-pkgs, 13 go
+#   this file + bumped go.mod    0 CVEs                           0 os-pkgs,  0 go
+#
+# Requires go-fips >= 1.25: `go mod tidy` resolved the module to `go 1.25.0`.
+FROM cgr.dev/armedia.com/go-fips:1.27 AS builder
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ cmd/
+COPY api/ api/
+COPY internal/ internal/
+
+# CGO_ENABLED=0 IS LOAD-BEARING. The runtime base is `static`, which has no dynamic
+# linker. Drop this and the build still succeeds, still scans clean, and still reports
+# GOFIPS140 - but the container dies with "exec /manager: no such file or directory",
+# a failure that reads as a missing file rather than a linkage problem. Verified the
+# hard way.
+#
+# GOFIPS140 selects the Go native FIPS 140-3 module, so the binary is self-contained and
+# needs no OpenSSL at runtime - which is why `static` is a sufficient base and no
+# openssl-provider-fips package is required.
+ENV GOFIPS140=latest CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+RUN go build -a -o manager cmd/main.go
+
+FROM cgr.dev/armedia.com/static:latest
+# Provenance the current image lacks entirely - it carries no labels, so the running
+# artefact cannot be traced to a commit.
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.source="https://github.com/Armedia/openproject-operator" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.title="openproject-operator" \
+      org.opencontainers.image.vendor="Armedia"
+COPY --from=builder /workspace/manager /manager
+USER 65532:65532
+ENTRYPOINT ["/manager"]
