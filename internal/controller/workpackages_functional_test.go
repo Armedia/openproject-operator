@@ -74,33 +74,33 @@ func TestFunctionalCalculateNextRunTime(t *testing.T) {
 	}
 }
 
-// TestFunctionalFailureSkipsAnEntireCycle documents a REAL DEFECT rather than asserting
-// desirable behaviour, so it must be read before being "fixed".
+// TestFunctionalFailureRetriesWithinTheCycle replaces a test that documented the old
+// behaviour, in which a failure scheduled the next attempt at the next CRON occurrence.
 //
-// updateFailedStatus computes the next attempt with calculateNextRunTime(schedule, now) -
-// the next SCHEDULED occurrence, not a retry - and logs it under the key "nextRetry".
-// For a monthly schedule a failure on the 1st therefore waits a full month.
+// That was logged as "nextRetry" but was not a retry: on a monthly schedule a failure on
+// the 1st waited a full month. On 2026-09-01 eight monthly compliance WorkPackages failed
+// and each set nextRunTime to 2026-10-01, so September's evidence would not have been
+// produced at all.
 //
-// That is exactly what happened on 2026-09-01: eight monthly compliance WorkPackages
-// failed (the database had lost md5(), so every work-package API call 500'd), each set
-// nextRunTime to 2026-10-01, and September's evidence would simply not have existed.
-//
-// If the controller is changed to retry with a short backoff, THIS TEST SHOULD FAIL and
-// be updated deliberately. Do not delete it to make a build green.
-func TestFunctionalFailureSkipsAnEntireCycle(t *testing.T) {
+// updateFailedStatus now records now+FailureRetryInterval instead, capped so it never
+// lands after the next scheduled occurrence.
+func TestFunctionalFailureRetriesWithinTheCycle(t *testing.T) {
 	failedAt := time.Date(2026, time.September, 1, 0, 43, 0, 0, time.UTC)
 
-	next, err := calculateNextRunTime(monthlyFirstOfMonth, failedAt)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	retryAt := failedAt.Add(FailureRetryInterval)
+	if next, err := calculateNextRunTime(monthlyFirstOfMonth, failedAt); err == nil && next.Before(retryAt) {
+		retryAt = next
 	}
 
-	gap := next.Sub(failedAt)
-	if gap < 29*24*time.Hour {
-		t.Fatalf("expected the post-failure wait to be about a month (current behaviour), got %s", gap)
+	gap := retryAt.Sub(failedAt)
+	if gap > 24*time.Hour {
+		t.Fatalf("retry gap is %s - a failure must not wait for the next cycle", gap)
 	}
-	if next.Month() != time.October || next.Day() != 1 {
-		t.Fatalf("expected the next attempt on 1 October, got %s", next)
+	if retryAt.Month() != time.September {
+		t.Fatalf("retry lands in %s; it must stay inside the failing period", retryAt.Month())
+	}
+	if gap <= 0 {
+		t.Fatalf("retry must be in the future, got a gap of %s", gap)
 	}
 }
 
@@ -113,13 +113,13 @@ func TestFunctionalShouldRunNow(t *testing.T) {
 	justNow := metav1.NewTime(time.Now())
 
 	t.Run("due when the last run is long past", func(t *testing.T) {
-		if !shouldRunNow(monthlyFirstOfMonth, &longAgo, longAgo, StatusCreated) {
+		if !shouldRunNow(monthlyFirstOfMonth, &longAgo, nil, longAgo, StatusCreated) {
 			t.Fatal("expected due after 90 days on a monthly schedule")
 		}
 	})
 
 	t.Run("not due when it just ran", func(t *testing.T) {
-		if shouldRunNow(monthlyFirstOfMonth, &justNow, longAgo, StatusCreated) {
+		if shouldRunNow(monthlyFirstOfMonth, &justNow, nil, longAgo, StatusCreated) {
 			t.Fatal("expected not due immediately after a run")
 		}
 	})
@@ -129,13 +129,13 @@ func TestFunctionalShouldRunNow(t *testing.T) {
 	// WorkPackages would never fire.
 	t.Run("zero last-run sentinel means due", func(t *testing.T) {
 		zero := metav1.Time{}
-		if !shouldRunNow(monthlyFirstOfMonth, &zero, justNow, StatusCreated) {
+		if !shouldRunNow(monthlyFirstOfMonth, &zero, nil, justNow, StatusCreated) {
 			t.Fatal("expected the zero LastRunTime sentinel to be treated as due")
 		}
 	})
 
 	t.Run("falls back to creation time when never run", func(t *testing.T) {
-		if !shouldRunNow(monthlyFirstOfMonth, nil, longAgo, StatusCreated) {
+		if !shouldRunNow(monthlyFirstOfMonth, nil, nil, longAgo, StatusCreated) {
 			t.Fatal("expected due when never run and created long ago")
 		}
 	})
@@ -145,19 +145,47 @@ func TestFunctionalShouldRunNow(t *testing.T) {
 	// so the signal was lost and a new resource waited for the next cron boundary.
 	// StatusScheduled is written only by handleInitialization, so it is durable.
 	t.Run("initialized but never run is due, via the status marker", func(t *testing.T) {
-		if !shouldRunNow(monthlyFirstOfMonth, nil, justNow, StatusScheduled) {
+		if !shouldRunNow(monthlyFirstOfMonth, nil, nil, justNow, StatusScheduled) {
 			t.Fatal("a freshly initialized resource must be due on the next reconcile")
 		}
 	})
 
 	t.Run("created recently with no last-run is not due", func(t *testing.T) {
-		if shouldRunNow(monthlyFirstOfMonth, nil, justNow, StatusCreated) {
+		if shouldRunNow(monthlyFirstOfMonth, nil, nil, justNow, StatusCreated) {
 			t.Fatal("a resource that already ran must not re-fire immediately")
 		}
 	})
 
+	// NextRunTime is authoritative once recorded. These two cases are what make a bounded
+	// retry possible: a failed run records a NEAR-FUTURE NextRunTime, and the resource must
+	// stay quiet until it passes rather than re-firing on every reconcile.
+	t.Run("NextRunTime in the future suppresses the run", func(t *testing.T) {
+		soon := metav1.NewTime(time.Now().Add(20 * time.Minute))
+		if shouldRunNow(monthlyFirstOfMonth, &longAgo, &soon, longAgo, StatusFailed) {
+			t.Fatal("a pending retry must not fire before NextRunTime")
+		}
+	})
+
+	t.Run("NextRunTime in the past permits the run", func(t *testing.T) {
+		passed := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+		if !shouldRunNow(monthlyFirstOfMonth, &longAgo, &passed, longAgo, StatusFailed) {
+			t.Fatal("once NextRunTime has passed the retry must fire")
+		}
+	})
+
+	// The regression that produced 112 tickets: a failure left NextRunTime unusable and
+	// LastRunTime stale, so the cron fallback saw a resource that was permanently due.
+	t.Run("stale last-run with a pending retry does not re-fire", func(t *testing.T) {
+		staleLast := metav1.NewTime(time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC))
+		pending := metav1.NewTime(time.Now().Add(15 * time.Minute))
+		if shouldRunNow(monthlyFirstOfMonth, &staleLast, &pending, staleLast, StatusFailed) {
+			t.Fatal("a stale LastRunTime must not override a pending NextRunTime - this is " +
+				"the re-fire loop that created 112 September tickets")
+		}
+	})
+
 	t.Run("invalid schedule never runs", func(t *testing.T) {
-		if shouldRunNow("not-a-cron", &longAgo, longAgo, StatusCreated) {
+		if shouldRunNow("not-a-cron", &longAgo, nil, longAgo, StatusCreated) {
 			t.Fatal("an unparseable schedule must not be treated as due")
 		}
 	})

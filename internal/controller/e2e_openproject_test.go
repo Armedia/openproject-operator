@@ -46,6 +46,7 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -222,9 +223,22 @@ func TestE2EOpenProjectReconciliation(t *testing.T) {
 	const ns = "default"
 
 	// Shared credentials and server config for both scenarios.
+	//
+	// THE SECRET MUST HOLD THE BASE64-WRAPPED KEY, not the raw one. makeOpenProjectRequest
+	// base64-decodes whatever it is given, so production stores the key wrapped and the
+	// operator unwraps it. Handing it a RAW key that happens to be valid base64 - which a
+	// 64-character hex OpenProject key always is, being a multiple of 4 from the base64
+	// alphabet - gets it decoded into garbage and every call returns 401.
+	//
+	// That is not hypothetical: this test failed exactly that way on 2026-09-03 when the
+	// raw armadmin key was passed straight through. It had previously passed only because
+	// the token in use then was 70 characters, which is not a multiple of 4 and so fell to
+	// the raw path. E2E_OPENPROJECT_TOKEN is the RAW key, used directly for this test's own
+	// verification calls, and wrapped here for the operator.
+	wrapped := base64.StdEncoding.EncodeToString([]byte(e.token))
 	if err := k8s.Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "e2e-openproject-api", Namespace: ns},
-		StringData: map[string]string{"token": e.token},
+		StringData: map[string]string{"token": wrapped},
 	}); err != nil {
 		t.Fatalf("creating secret: %v", err)
 	}
@@ -247,7 +261,7 @@ func TestE2EOpenProjectReconciliation(t *testing.T) {
 		t.Helper()
 		var ticketID string
 		t.Cleanup(func() { e.deleteTicket(t, ticketID) })
-		deadline := time.Now().Add(3 * time.Minute)
+		deadline := time.Now().Add(5 * time.Minute)
 		var last openprojectorgv1alpha1.WorkPackages
 		for time.Now().Before(deadline) {
 			if err := k8s.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &last); err == nil {

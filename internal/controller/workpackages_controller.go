@@ -42,6 +42,12 @@ var (
 	DefaultRequeueTime = getDurationFromEnv("DEFAULT_REQUEUE_TIME", time.Minute*1)
 	ShortRequeueTime   = getDurationFromEnv("SHORT_REQUEUE_TIME", time.Second*30)
 	RequestTimeout     = getDurationFromEnv("REQUEST_TIMEOUT", time.Second*90)
+	// How long to wait before retrying after a failed ticket creation. Bounded on
+	// purpose: before this existed, a failure left NextRunTime at the next CRON
+	// occurrence and LastRunTime untouched, so the resource looked permanently due and
+	// re-fired on every reconcile. Between 2026-09-01 and 2026-09-03 that produced 14
+	// rounds of the 8 monthly compliance tickets - 112 where 8 were wanted.
+	FailureRetryInterval = getDurationFromEnv("FAILURE_RETRY_INTERVAL", time.Minute*30)
 
 	// Reusable HTTP client
 	httpClient = &http.Client{Timeout: RequestTimeout}
@@ -429,7 +435,7 @@ func (r *WorkPackageReconciler) triggerCloudInventoryScan(ctx context.Context, w
 //
 // StatusScheduled is written ONLY by handleInitialization (success sets Created, failure
 // sets Failed), so it is an accurate and durable marker for the same intent.
-func shouldRunNow(schedule string, lastRun *metav1.Time, creationTime metav1.Time, status string) bool {
+func shouldRunNow(schedule string, lastRun, nextRun *metav1.Time, creationTime metav1.Time, status string) bool {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	spec, err := parser.Parse(schedule)
 	if err != nil {
@@ -444,6 +450,24 @@ func shouldRunNow(schedule string, lastRun *metav1.Time, creationTime metav1.Tim
 	}
 
 	now := time.Now()
+
+	// NextRunTime is AUTHORITATIVE once recorded, and it is the only field that carries
+	// both meanings correctly:
+	//   success -> the next cron occurrence
+	//   failure -> now + FailureRetryInterval, a bounded retry
+	//
+	// Deriving this from the cron schedule and LastRunTime instead is what produced two
+	// opposite bugs from one gap. A failure recorded NextRunTime as the next cron
+	// occurrence but left LastRunTime untouched, so reading LastRunTime made the resource
+	// look permanently due (re-fired every reconcile: 112 tickets where 8 were wanted),
+	// while reading the cron occurrence would have skipped an entire month. Neither is
+	// right; a bounded retry is, and NextRunTime is where it lives.
+	if nextRun != nil && !nextRun.IsZero() {
+		return now.After(nextRun.Time)
+	}
+
+	// No NextRunTime recorded - a resource from before this field was maintained. Fall
+	// back to the schedule against the last run, or creation if it has never run.
 	last := creationTime.Time
 	if lastRun != nil && !lastRun.IsZero() {
 		last = lastRun.Time
@@ -556,14 +580,22 @@ func (r *WorkPackageReconciler) handleCreateTicket(ctx context.Context, wp *v1al
 // updateFailedStatus updates the status to reflect a failed ticket creation
 func (r *WorkPackageReconciler) updateFailedStatus(ctx context.Context, wp *v1alpha1.WorkPackages, log logr.Logger) {
 	now := time.Now()
-	next, err := calculateNextRunTime(wp.Spec.Schedule, now)
-	if err != nil {
-		log.Error(err, "❌ Failed to calculate next run time")
-		return
+
+	// Retry after a bounded interval rather than at the next CRON occurrence. The old
+	// behaviour was logged as "nextRetry" but was not a retry at all: on a monthly
+	// schedule a failure on the 1st waited until the 1st of the next month, so the
+	// 2026-09-01 failures set nextRunTime to 2026-10-01 and September's compliance
+	// evidence would simply not have been produced.
+	retryAt := now.Add(FailureRetryInterval)
+
+	// Never push the retry PAST the next scheduled occurrence - if the schedule comes
+	// round sooner than the retry interval, the schedule wins.
+	if next, err := calculateNextRunTime(wp.Spec.Schedule, now); err == nil && next.Before(retryAt) {
+		retryAt = next
 	}
 
 	update := WorkPackageStatusUpdate{
-		NextRunTime: &metav1.Time{Time: next},
+		NextRunTime: &metav1.Time{Time: retryAt},
 		Status:      StatusFailed,
 		Message:     "Ticket creation failed",
 	}
@@ -572,7 +604,7 @@ func (r *WorkPackageReconciler) updateFailedStatus(ctx context.Context, wp *v1al
 		log.Error(err, "❌ Failed to update failed status")
 	}
 
-	statusLog(log, "❌", "Ticket creation failed", "nextRetry", next.Format(time.RFC3339))
+	statusLog(log, "❌", "Ticket creation failed", "nextRetry", retryAt.Format(time.RFC3339))
 }
 
 // loadConfig loads the server configuration and API key
@@ -613,7 +645,7 @@ func (r *WorkPackageReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Check if it's time to run
-	if !shouldRunNow(wp.Spec.Schedule, wp.Status.LastRunTime, wp.CreationTimestamp, wp.Status.Status) {
+	if !shouldRunNow(wp.Spec.Schedule, wp.Status.LastRunTime, wp.Status.NextRunTime, wp.CreationTimestamp, wp.Status.Status) {
 		statusLog(log, "⏳", "Not time to run yet based on schedule", "schedule", wp.Spec.Schedule)
 		return ctrl.Result{RequeueAfter: DefaultRequeueTime}, nil
 	}
