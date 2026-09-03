@@ -43,8 +43,19 @@ func (r *CloudInventoryReconciler) reconcileKubernetes(ctx context.Context, ci *
 			return ctrl.Result{}, err
 		}
 	} else {
-		// Local cluster
-		restConfig, err = ctrl.GetConfig()
+		// Local cluster.
+		//
+		// Prefer the config the manager was built with. ctrl.GetConfig() reads the
+		// AMBIENT kubeconfig or in-cluster service account, which is not necessarily the
+		// cluster this operator is managing - and when neither is present it fails, the
+		// scan returns an error, and the calling WorkPackages still creates its ticket
+		// with no report attached. That failure reads as "the inventory silently did not
+		// run". Falling back keeps behaviour unchanged when Config is not supplied.
+		if r.Config != nil {
+			restConfig = r.Config
+		} else {
+			restConfig, err = ctrl.GetConfig()
+		}
 		clusterName = "operator-local"
 		if err != nil {
 			ci.Status.LastFailedTime = &metav1.Time{Time: time.Now()}

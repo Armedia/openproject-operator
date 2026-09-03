@@ -1,6 +1,9 @@
 package controller
 
 import (
+	neturl "net/url"
+	"strconv"
+	"k8s.io/client-go/rest"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -41,6 +44,17 @@ var (
 	DefaultRequeueTime = getDurationFromEnv("DEFAULT_REQUEUE_TIME", time.Minute*1)
 	ShortRequeueTime   = getDurationFromEnv("SHORT_REQUEUE_TIME", time.Second*30)
 	RequestTimeout     = getDurationFromEnv("REQUEST_TIMEOUT", time.Second*90)
+	// How long to wait before retrying after a failed ticket creation. Bounded on
+	// purpose: before this existed, a failure left NextRunTime at the next CRON
+	// occurrence and LastRunTime untouched, so the resource looked permanently due and
+	// re-fired on every reconcile. Between 2026-09-01 and 2026-09-03 that produced 14
+	// rounds of the 8 monthly compliance tickets - 112 where 8 were wanted.
+	FailureRetryInterval = getDurationFromEnv("FAILURE_RETRY_INTERVAL", time.Minute*30)
+	// How far back the idempotency check looks for an identical ticket. Bounded rather than
+	// unlimited because the subject is only MONTH-scoped - buildTicketPayload prefixes
+	// time.Now().Format("January") - so "February Contingency Plan Test" recurs every year.
+	// An unbounded search would find last year's ticket and never create this year's.
+	DuplicateLookback = getDurationFromEnv("DUPLICATE_LOOKBACK", time.Hour*24*7)
 
 	// Reusable HTTP client
 	httpClient = &http.Client{Timeout: RequestTimeout}
@@ -100,6 +114,10 @@ type WorkPackageStatusUpdate struct {
 type WorkPackageReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Config is the manager's rest.Config, threaded through to CloudInventory scans so
+	// local-mode inventory does not fall back to the ambient kubeconfig. Optional: when
+	// nil the inventory keeps its previous ctrl.GetConfig() behaviour.
+	Config *rest.Config
 }
 
 // maybeBase64 makes a best guess if a string is base64 encoded
@@ -330,7 +348,7 @@ func (r *WorkPackageReconciler) triggerCloudInventoryScan(ctx context.Context, w
 	logs = append(logs, fmt.Sprintf("Found CloudInventory: %s (mode: %s)", inv.Name, inv.Spec.Mode))
 
 	// Prepare the reconciler
-	cloudRec := &CloudInventoryReconciler{Client: r.Client, Scheme: r.Scheme}
+	cloudRec := &CloudInventoryReconciler{Client: r.Client, Scheme: r.Scheme, Config: r.Config}
 	var err error
 
 	// Dispatch based on Mode or which spec is present
@@ -411,23 +429,55 @@ func (r *WorkPackageReconciler) triggerCloudInventoryScan(ctx context.Context, w
 	return latest, logs, nil
 }
 
-// shouldRunNow determines if it's time to create a ticket
-func shouldRunNow(schedule string, lastRun *metav1.Time, creationTime metav1.Time) bool {
+// shouldRunNow determines if it's time to create a ticket.
+//
+// `status` is the persisted Status.Status. It is needed because the previous
+// "initialized, awaiting first run" signal did not survive a round-trip through the API
+// server: handleInitialization wrote LastRunTime as a ZERO metav1.Time, but metav1.Time
+// marshals a zero value to JSON null, and the field is `omitempty`, so it read back as
+// nil rather than as a non-nil pointer to zero. The zero branch below was therefore
+// unreachable in a real cluster, and a freshly created WorkPackages never fired on
+// creation - it waited for the next cron boundary. Observed 2026-09-03: a resource with
+// schedule "0 0 1 * *" sat at status=Scheduled, nextRun=2026-10-01 and never ran.
+//
+// StatusScheduled is written ONLY by handleInitialization (success sets Created, failure
+// sets Failed), so it is an accurate and durable marker for the same intent.
+func shouldRunNow(schedule string, lastRun, nextRun *metav1.Time, creationTime metav1.Time, status string) bool {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	spec, err := parser.Parse(schedule)
 	if err != nil {
 		return false
 	}
+
+	// Initialized and never run: fire on this reconcile. Covers both the durable status
+	// marker and the legacy zero-time sentinel, so resources written by an older operator
+	// still behave the same way.
+	if (lastRun == nil && status == StatusScheduled) || (lastRun != nil && lastRun.IsZero()) {
+		return true
+	}
+
 	now := time.Now()
+
+	// NextRunTime is AUTHORITATIVE once recorded, and it is the only field that carries
+	// both meanings correctly:
+	//   success -> the next cron occurrence
+	//   failure -> now + FailureRetryInterval, a bounded retry
+	//
+	// Deriving this from the cron schedule and LastRunTime instead is what produced two
+	// opposite bugs from one gap. A failure recorded NextRunTime as the next cron
+	// occurrence but left LastRunTime untouched, so reading LastRunTime made the resource
+	// look permanently due (re-fired every reconcile: 112 tickets where 8 were wanted),
+	// while reading the cron occurrence would have skipped an entire month. Neither is
+	// right; a bounded retry is, and NextRunTime is where it lives.
+	if nextRun != nil && !nextRun.IsZero() {
+		return now.After(nextRun.Time)
+	}
+
+	// No NextRunTime recorded - a resource from before this field was maintained. Fall
+	// back to the schedule against the last run, or creation if it has never run.
 	last := creationTime.Time
-	if lastRun != nil {
-		if !lastRun.IsZero() {
-			last = lastRun.Time
-		} else {
-			// If LastRunTime exists but is zero, this is an initialized resource
-			// waiting for first run - check against NextRunTime instead
-			return true
-		}
+	if lastRun != nil && !lastRun.IsZero() {
+		last = lastRun.Time
 	}
 	return now.After(spec.Next(last))
 }
@@ -458,6 +508,75 @@ func (r *WorkPackageReconciler) handleInitialization(ctx context.Context, wp *v1
 	return ctrl.Result{RequeueAfter: DefaultRequeueTime}, nil
 }
 
+
+// findRecentTicket looks for a work package that already carries this exact subject in
+// this project, created within DuplicateLookback.
+//
+// WHY THIS EXISTS. Ticket creation is not idempotent, and the failure mode is not
+// theoretical: when the database could not compute md5(), OpenProject COMMITTED the work
+// package and then failed while rendering the response. The operator saw an error, retried,
+// and produced another ticket each time - 112 where 8 were wanted between 2026-09-01 and
+// 2026-09-03. Bounding the retry interval limits how fast that happens; only a duplicate
+// check stops it.
+//
+// Matching is on the EXACT composed subject (the month-prefixed one that would be sent),
+// scoped to the project and to a recent window. The API filter uses "~" (contains), which
+// can over-match, so the exact comparison is redone client-side.
+//
+// It FAILS OPEN. If the lookup errors the caller creates the ticket anyway: a possible
+// duplicate is a far better outcome than silently producing no compliance evidence.
+func (r *WorkPackageReconciler) findRecentTicket(
+	ctx context.Context, server, apiKey string, projectID int, subject string, log logr.Logger,
+) (string, error) {
+	filters := fmt.Sprintf(
+		`[{"project":{"operator":"=","values":["%d"]}},{"subject":{"operator":"~","values":[%s]}}]`,
+		projectID, strconv.Quote(subject))
+	endpoint := fmt.Sprintf("%s/api/v3/work_packages?pageSize=100&filters=%s",
+		server, neturl.QueryEscape(filters))
+
+	resp, err := makeOpenProjectRequest(ctx, http.MethodGet, endpoint, apiKey, nil)
+	if err != nil {
+		return "", fmt.Errorf("duplicate lookup request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("duplicate lookup returned HTTP %d", resp.StatusCode)
+	}
+
+	var page struct {
+		Embedded struct {
+			Elements []struct {
+				ID        int    `json:"id"`
+				Subject   string `json:"subject"`
+				CreatedAt string `json:"createdAt"`
+			} `json:"elements"`
+		} `json:"_embedded"`
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading duplicate lookup response: %w", err)
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		return "", fmt.Errorf("decoding duplicate lookup response: %w", err)
+	}
+
+	cutoff := time.Now().Add(-DuplicateLookback)
+	for _, el := range page.Embedded.Elements {
+		if el.Subject != subject {
+			continue // "~" is a contains match; require an exact subject
+		}
+		created, err := time.Parse(time.RFC3339, el.CreatedAt)
+		if err != nil {
+			// Unparseable timestamp: treat as a match rather than risk a duplicate.
+			return strconv.Itoa(el.ID), nil
+		}
+		if created.After(cutoff) {
+			return strconv.Itoa(el.ID), nil
+		}
+	}
+	return "", nil
+}
+
 // handleCreateTicket creates a ticket in OpenProject
 func (r *WorkPackageReconciler) handleCreateTicket(ctx context.Context, wp *v1alpha1.WorkPackages, config *v1alpha1.ServerConfig, apiKey string, log logr.Logger) (ctrl.Result, error) {
 	statusLog(log, "🔄", "Creating new ticket", "subject", wp.Spec.Subject)
@@ -477,6 +596,32 @@ func (r *WorkPackageReconciler) handleCreateTicket(ctx context.Context, wp *v1al
 	if err != nil {
 		log.Error(err, "❌ Failed to marshal JSON payload")
 		return ctrl.Result{}, err
+	}
+
+	// IDEMPOTENCY GUARD. Check for an identical ticket before creating another one.
+	// Fails open: a lookup error must never stop compliance evidence being produced.
+	if subject, ok := payload["subject"].(string); ok && subject != "" {
+		existingID, lookupErr := r.findRecentTicket(ctx, config.Spec.Server, apiKey, wp.Spec.ProjectID, subject, log)
+		switch {
+		case lookupErr != nil:
+			statusLog(log, "⚠", "Duplicate check failed, creating anyway", "error", lookupErr.Error())
+		case existingID != "":
+			statusLog(log, "♻", "Ticket already exists, adopting it instead of creating a duplicate",
+				"ticketID", existingID, "subject", subject)
+			now := time.Now()
+			next, _ := calculateNextRunTime(wp.Spec.Schedule, now)
+			update := WorkPackageStatusUpdate{
+				LastRunTime: &metav1.Time{Time: now},
+				NextRunTime: &metav1.Time{Time: next},
+				TicketID:    existingID,
+				Status:      StatusCreated,
+				Message:     "Ticket already existed; adopted rather than duplicated",
+			}
+			if err := applyStatusUpdate(ctx, r, wp, update, log); err != nil {
+				log.Error(err, "❌ Failed to update status after adopting an existing ticket")
+			}
+			return ctrl.Result{RequeueAfter: DefaultRequeueTime}, nil
+		}
 	}
 
 	// Prepare API request
@@ -537,14 +682,22 @@ func (r *WorkPackageReconciler) handleCreateTicket(ctx context.Context, wp *v1al
 // updateFailedStatus updates the status to reflect a failed ticket creation
 func (r *WorkPackageReconciler) updateFailedStatus(ctx context.Context, wp *v1alpha1.WorkPackages, log logr.Logger) {
 	now := time.Now()
-	next, err := calculateNextRunTime(wp.Spec.Schedule, now)
-	if err != nil {
-		log.Error(err, "❌ Failed to calculate next run time")
-		return
+
+	// Retry after a bounded interval rather than at the next CRON occurrence. The old
+	// behaviour was logged as "nextRetry" but was not a retry at all: on a monthly
+	// schedule a failure on the 1st waited until the 1st of the next month, so the
+	// 2026-09-01 failures set nextRunTime to 2026-10-01 and September's compliance
+	// evidence would simply not have been produced.
+	retryAt := now.Add(FailureRetryInterval)
+
+	// Never push the retry PAST the next scheduled occurrence - if the schedule comes
+	// round sooner than the retry interval, the schedule wins.
+	if next, err := calculateNextRunTime(wp.Spec.Schedule, now); err == nil && next.Before(retryAt) {
+		retryAt = next
 	}
 
 	update := WorkPackageStatusUpdate{
-		NextRunTime: &metav1.Time{Time: next},
+		NextRunTime: &metav1.Time{Time: retryAt},
 		Status:      StatusFailed,
 		Message:     "Ticket creation failed",
 	}
@@ -553,7 +706,7 @@ func (r *WorkPackageReconciler) updateFailedStatus(ctx context.Context, wp *v1al
 		log.Error(err, "❌ Failed to update failed status")
 	}
 
-	statusLog(log, "❌", "Ticket creation failed", "nextRetry", next.Format(time.RFC3339))
+	statusLog(log, "❌", "Ticket creation failed", "nextRetry", retryAt.Format(time.RFC3339))
 }
 
 // loadConfig loads the server configuration and API key
@@ -594,7 +747,7 @@ func (r *WorkPackageReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Check if it's time to run
-	if !shouldRunNow(wp.Spec.Schedule, wp.Status.LastRunTime, wp.CreationTimestamp) {
+	if !shouldRunNow(wp.Spec.Schedule, wp.Status.LastRunTime, wp.Status.NextRunTime, wp.CreationTimestamp, wp.Status.Status) {
 		statusLog(log, "⏳", "Not time to run yet based on schedule", "schedule", wp.Spec.Schedule)
 		return ctrl.Result{RequeueAfter: DefaultRequeueTime}, nil
 	}
