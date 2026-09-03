@@ -127,6 +127,40 @@ func (e e2eEnv) deleteTicket(t *testing.T, id string) {
 	t.Logf("cleaned up ticket %s", id)
 }
 
+
+// createTicket makes a work package directly, so a test can plant one for the operator to
+// find. Returns the new id.
+func (e e2eEnv) createTicket(t *testing.T, subject string) string {
+	t.Helper()
+	body := fmt.Sprintf(
+		`{"subject":%s,"_links":{"type":{"href":"/api/v3/types/%d"},"project":{"href":"/api/v3/projects/%d"}}}`,
+		strconvQuote(subject), e.typeID, e.projectID)
+	req, err := http.NewRequest(http.MethodPost, e.url+"/api/v3/work_packages", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("building create request: %v", err)
+	}
+	req.SetBasicAuth("apikey", e.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("creating ticket: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		t.Fatalf("creating ticket returned HTTP %d: %s", resp.StatusCode, truncate(raw, 200))
+	}
+	var got struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil || got.ID == 0 {
+		t.Fatalf("could not read new ticket id from %s", truncate(raw, 200))
+	}
+	return strconv.Itoa(got.ID)
+}
+
+func strconvQuote(s string) string { return strconv.Quote(s) }
+
 // TestE2EOpenProjectPreflight fails fast with a clear reason when the environment is not
 // usable, so a later timeout is never mistaken for an operator defect.
 func TestE2EOpenProjectPreflight(t *testing.T) {
@@ -342,6 +376,50 @@ func TestE2EOpenProjectReconciliation(t *testing.T) {
 		}
 		t.Logf("VERIFIED: ticket %s exists in OpenProject as %q in project %d",
 			ticketID, got.Subject, e.projectID)
+	})
+
+	t.Run("adopts an existing ticket instead of duplicating", func(t *testing.T) {
+		// The idempotency guard. Plant a ticket carrying the EXACT subject the operator
+		// would compose - it prefixes the month name - then let the operator run. It must
+		// find and adopt that ticket rather than creating a second one.
+		//
+		// This is the failure that produced 112 work packages: when the database could not
+		// compute md5(), OpenProject COMMITTED each ticket and then failed while rendering
+		// the response, so every retry added another.
+		stamp := time.Now().UTC().Format("20060102-150405")
+		specSubject := fmt.Sprintf("%s adopt %s", e2eSubjectPrefix, stamp)
+		composed := fmt.Sprintf("%s %s", time.Now().Format("January"), specSubject)
+
+		planted := e.createTicket(t, composed)
+		t.Cleanup(func() { e.deleteTicket(t, planted) })
+		t.Logf("planted ticket %s with subject %q", planted, composed)
+
+		if err := k8s.Create(ctx, &openprojectorgv1alpha1.WorkPackages{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-adopt-workpackage", Namespace: ns},
+			Spec: openprojectorgv1alpha1.WorkPackagesSpec{
+				Subject:         specSubject,
+				Description:     "Idempotency verification. Safe to delete.",
+				ProjectID:       e.projectID,
+				TypeID:          e.typeID,
+				Schedule:        "0 0 1 * *",
+				ServerConfigRef: corev1.LocalObjectReference{Name: "e2e-serverconfig"},
+			},
+		}); err != nil {
+			t.Fatalf("creating WorkPackages: %v", err)
+		}
+
+		adoptedID, last := waitForTicket(t, "e2e-adopt-workpackage")
+
+		if adoptedID != planted {
+			// A different id means it created a second ticket - the guard did not work.
+			t.Cleanup(func() { e.deleteTicket(t, adoptedID) })
+			t.Fatalf("operator reported ticket %s but should have adopted the planted %s - "+
+				"a duplicate was created", adoptedID, planted)
+		}
+		if last.Status.Status != StatusCreated {
+			t.Errorf("status = %q, want %q after adoption", last.Status.Status, StatusCreated)
+		}
+		t.Logf("VERIFIED idempotency: adopted planted ticket %s, no duplicate created", adoptedID)
 	})
 
 	t.Run("runs an inventory and produces a report", func(t *testing.T) {

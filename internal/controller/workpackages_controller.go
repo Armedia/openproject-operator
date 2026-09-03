@@ -1,6 +1,8 @@
 package controller
 
 import (
+	neturl "net/url"
+	"strconv"
 	"k8s.io/client-go/rest"
 	"bytes"
 	"context"
@@ -48,6 +50,11 @@ var (
 	// re-fired on every reconcile. Between 2026-09-01 and 2026-09-03 that produced 14
 	// rounds of the 8 monthly compliance tickets - 112 where 8 were wanted.
 	FailureRetryInterval = getDurationFromEnv("FAILURE_RETRY_INTERVAL", time.Minute*30)
+	// How far back the idempotency check looks for an identical ticket. Bounded rather than
+	// unlimited because the subject is only MONTH-scoped - buildTicketPayload prefixes
+	// time.Now().Format("January") - so "February Contingency Plan Test" recurs every year.
+	// An unbounded search would find last year's ticket and never create this year's.
+	DuplicateLookback = getDurationFromEnv("DUPLICATE_LOOKBACK", time.Hour*24*7)
 
 	// Reusable HTTP client
 	httpClient = &http.Client{Timeout: RequestTimeout}
@@ -501,6 +508,75 @@ func (r *WorkPackageReconciler) handleInitialization(ctx context.Context, wp *v1
 	return ctrl.Result{RequeueAfter: DefaultRequeueTime}, nil
 }
 
+
+// findRecentTicket looks for a work package that already carries this exact subject in
+// this project, created within DuplicateLookback.
+//
+// WHY THIS EXISTS. Ticket creation is not idempotent, and the failure mode is not
+// theoretical: when the database could not compute md5(), OpenProject COMMITTED the work
+// package and then failed while rendering the response. The operator saw an error, retried,
+// and produced another ticket each time - 112 where 8 were wanted between 2026-09-01 and
+// 2026-09-03. Bounding the retry interval limits how fast that happens; only a duplicate
+// check stops it.
+//
+// Matching is on the EXACT composed subject (the month-prefixed one that would be sent),
+// scoped to the project and to a recent window. The API filter uses "~" (contains), which
+// can over-match, so the exact comparison is redone client-side.
+//
+// It FAILS OPEN. If the lookup errors the caller creates the ticket anyway: a possible
+// duplicate is a far better outcome than silently producing no compliance evidence.
+func (r *WorkPackageReconciler) findRecentTicket(
+	ctx context.Context, server, apiKey string, projectID int, subject string, log logr.Logger,
+) (string, error) {
+	filters := fmt.Sprintf(
+		`[{"project":{"operator":"=","values":["%d"]}},{"subject":{"operator":"~","values":[%s]}}]`,
+		projectID, strconv.Quote(subject))
+	endpoint := fmt.Sprintf("%s/api/v3/work_packages?pageSize=100&filters=%s",
+		server, neturl.QueryEscape(filters))
+
+	resp, err := makeOpenProjectRequest(ctx, http.MethodGet, endpoint, apiKey, nil)
+	if err != nil {
+		return "", fmt.Errorf("duplicate lookup request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("duplicate lookup returned HTTP %d", resp.StatusCode)
+	}
+
+	var page struct {
+		Embedded struct {
+			Elements []struct {
+				ID        int    `json:"id"`
+				Subject   string `json:"subject"`
+				CreatedAt string `json:"createdAt"`
+			} `json:"elements"`
+		} `json:"_embedded"`
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading duplicate lookup response: %w", err)
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		return "", fmt.Errorf("decoding duplicate lookup response: %w", err)
+	}
+
+	cutoff := time.Now().Add(-DuplicateLookback)
+	for _, el := range page.Embedded.Elements {
+		if el.Subject != subject {
+			continue // "~" is a contains match; require an exact subject
+		}
+		created, err := time.Parse(time.RFC3339, el.CreatedAt)
+		if err != nil {
+			// Unparseable timestamp: treat as a match rather than risk a duplicate.
+			return strconv.Itoa(el.ID), nil
+		}
+		if created.After(cutoff) {
+			return strconv.Itoa(el.ID), nil
+		}
+	}
+	return "", nil
+}
+
 // handleCreateTicket creates a ticket in OpenProject
 func (r *WorkPackageReconciler) handleCreateTicket(ctx context.Context, wp *v1alpha1.WorkPackages, config *v1alpha1.ServerConfig, apiKey string, log logr.Logger) (ctrl.Result, error) {
 	statusLog(log, "🔄", "Creating new ticket", "subject", wp.Spec.Subject)
@@ -520,6 +596,32 @@ func (r *WorkPackageReconciler) handleCreateTicket(ctx context.Context, wp *v1al
 	if err != nil {
 		log.Error(err, "❌ Failed to marshal JSON payload")
 		return ctrl.Result{}, err
+	}
+
+	// IDEMPOTENCY GUARD. Check for an identical ticket before creating another one.
+	// Fails open: a lookup error must never stop compliance evidence being produced.
+	if subject, ok := payload["subject"].(string); ok && subject != "" {
+		existingID, lookupErr := r.findRecentTicket(ctx, config.Spec.Server, apiKey, wp.Spec.ProjectID, subject, log)
+		switch {
+		case lookupErr != nil:
+			statusLog(log, "⚠", "Duplicate check failed, creating anyway", "error", lookupErr.Error())
+		case existingID != "":
+			statusLog(log, "♻", "Ticket already exists, adopting it instead of creating a duplicate",
+				"ticketID", existingID, "subject", subject)
+			now := time.Now()
+			next, _ := calculateNextRunTime(wp.Spec.Schedule, now)
+			update := WorkPackageStatusUpdate{
+				LastRunTime: &metav1.Time{Time: now},
+				NextRunTime: &metav1.Time{Time: next},
+				TicketID:    existingID,
+				Status:      StatusCreated,
+				Message:     "Ticket already existed; adopted rather than duplicated",
+			}
+			if err := applyStatusUpdate(ctx, r, wp, update, log); err != nil {
+				log.Error(err, "❌ Failed to update status after adopting an existing ticket")
+			}
+			return ctrl.Result{RequeueAfter: DefaultRequeueTime}, nil
+		}
 	}
 
 	// Prepare API request

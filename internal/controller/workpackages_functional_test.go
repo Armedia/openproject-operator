@@ -11,6 +11,9 @@ package controller
 // tickets silently did not get created. Two of these tests would have caught it.
 
 import (
+	"github.com/go-logr/logr"
+	neturl "net/url"
+	"encoding/json"
 	"context"
 	"encoding/base64"
 	"io"
@@ -396,5 +399,129 @@ func TestFunctionalRequestContextCancellation(t *testing.T) {
 
 	if _, err := makeOpenProjectRequest(ctx, http.MethodGet, srv.URL, "k", nil); err == nil {
 		t.Fatal("expected an error when the context is already cancelled")
+	}
+}
+
+// --------------------------------------------------------------------------------------
+// findRecentTicket - the idempotency guard
+// --------------------------------------------------------------------------------------
+
+// page renders an OpenProject collection response containing the given elements.
+func page(t *testing.T, els ...map[string]interface{}) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]interface{}{
+		"_embedded": map[string]interface{}{"elements": els},
+	})
+	if err != nil {
+		t.Fatalf("building fixture: %v", err)
+	}
+	return string(b)
+}
+
+func TestFunctionalFindRecentTicket(t *testing.T) {
+	const subject = "September AWS Systems Inventory"
+	recent := time.Now().Add(-2 * time.Hour).Format(time.RFC3339)
+	stale := time.Now().Add(-400 * 24 * time.Hour).Format(time.RFC3339)
+
+	cases := []struct {
+		name string
+		body string
+		code int
+		want string
+		err  bool
+	}{
+		{
+			name: "exact subject within the window is adopted",
+			body: `PAGE_MATCH`,
+			code: 200, want: "705",
+		},
+		{
+			name: "contains-but-not-exact is not a match",
+			// "~" is a contains filter, so the server can return near misses. Adopting one
+			// would silently attach the wrong ticket to a control.
+			body: `PAGE_NEAR`,
+			code: 200, want: "",
+		},
+		{
+			name: "exact subject but a year old is not a match",
+			// The subject is month-scoped, not year-scoped: February recurs annually. An
+			// unbounded search would adopt last year's ticket and never create this year's.
+			body: `PAGE_STALE`,
+			code: 200, want: "",
+		},
+		{
+			name: "empty collection means create",
+			body: `PAGE_EMPTY`,
+			code: 200, want: "",
+		},
+		{
+			name: "server error surfaces so the caller fails OPEN and creates",
+			body: `{}`, code: 500, err: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.body
+			switch body {
+			case "PAGE_MATCH":
+				body = page(t, map[string]interface{}{"id": 705, "subject": subject, "createdAt": recent})
+			case "PAGE_NEAR":
+				body = page(t, map[string]interface{}{"id": 706, "subject": subject + " (follow-up)", "createdAt": recent})
+			case "PAGE_STALE":
+				body = page(t, map[string]interface{}{"id": 400, "subject": subject, "createdAt": stale})
+			case "PAGE_EMPTY":
+				body = page(t)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("lookup used %s, want GET", r.Method)
+				}
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+
+			got, err := (&WorkPackageReconciler{}).findRecentTicket(
+				context.Background(), srv.URL, "k", 4, subject, logr.Discard())
+			if tc.err {
+				if err == nil {
+					t.Fatal("expected an error so the caller fails open and creates the ticket")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("findRecentTicket = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFunctionalFindRecentTicketScopesTheQuery checks the request itself: the guard must
+// ask about the right project and subject, or it could adopt a ticket from another project.
+func TestFunctionalFindRecentTicketScopesTheQuery(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"_embedded":{"elements":[]}}`))
+	}))
+	defer srv.Close()
+
+	if _, err := (&WorkPackageReconciler{}).findRecentTicket(
+		context.Background(), srv.URL, "k", 42, "September System Patching", logr.Discard()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	decoded, err := neturl.QueryUnescape(gotQuery)
+	if err != nil {
+		t.Fatalf("query not decodable: %v", err)
+	}
+	for _, want := range []string{`"project"`, `"42"`, `September System Patching`} {
+		if !strings.Contains(decoded, want) {
+			t.Fatalf("query %q does not scope on %s", decoded, want)
+		}
 	}
 }
