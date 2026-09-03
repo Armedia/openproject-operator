@@ -250,21 +250,25 @@ func TestFunctionalMakeOpenProjectRequestAuthAndMethod(t *testing.T) {
 	}
 }
 
-// TestFunctionalBase64LookalikeKeyIsMangled documents a SECOND REAL DEFECT.
+// TestFunctionalBase64WrappedKeyIsDecoded pins INTENDED behaviour, not a defect.
 //
-// makeOpenProjectRequest tries base64-decoding the API key first and, if that succeeds,
-// sends the DECODED bytes as the credential. Plenty of ordinary tokens are accidentally
-// valid base64 - any token whose length is a multiple of 4 drawn from the base64 alphabet
-// qualifies - and those are silently corrupted before they are ever sent.
+// makeOpenProjectRequest base64-decodes the API key and, if that succeeds, sends the
+// decoded bytes as the credential. That is deliberate and it is what this deployment
+// relies on: the token in openproject-armedia-us-api is stored base64-WRAPPED - 88
+// characters that decode to the real 64-char hex OpenProject key.
 //
-// This is the likely explanation for the stored 88-character token being rejected with
-// 401 on 2026-09-02 while a 70-character replacement worked: 88 is a multiple of 4, 70 is
-// not. The fix is to stop guessing at the encoding and send the key as given, but that
-// changes behaviour for anyone who stored a genuinely base64-wrapped key, so it is
-// recorded here rather than quietly changed.
+// AN EARLIER VERSION OF THIS TEST CALLED THIS A DEFECT AND WAS WRONG. It claimed the
+// decoding had corrupted a valid token and caused a 401 on 2026-09-02. It had not. The
+// 401 came from a test that sent the 88-char WRAPPED value directly instead of decoding
+// it first; the operator, which decodes, was authenticating fine throughout - provable
+// from work-package authorship, where armadmin had been creating tickets the whole time.
+// The real cause of the failures was the FIPS PostgreSQL md5() breakage.
 //
-// If the guessing is removed, THIS TEST SHOULD FAIL. Update it deliberately.
-func TestFunctionalBase64LookalikeKeyIsMangled(t *testing.T) {
+// The residual hazard is narrower than that claim: a RAW token that happens to be valid
+// base64 - any token whose length is a multiple of 4 drawn from the base64 alphabet -
+// would be decoded and mangled. Worth knowing before changing how keys are stored, but it
+// is not what happened here, and removing the decode would break this deployment.
+func TestFunctionalBase64WrappedKeyIsDecoded(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -272,26 +276,48 @@ func TestFunctionalBase64LookalikeKeyIsMangled(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// A 40-character token that is coincidentally valid base64.
-	lookalike := strings.Repeat("QUJD", 10) // decodes to "ABC" x10
-	if _, err := base64.StdEncoding.DecodeString(lookalike); err != nil {
-		t.Fatalf("test fixture is not valid base64: %v", err)
+	// Mirrors the real secret: a 64-char hex key, base64-wrapped to 88 characters.
+	realKey := strings.Repeat("ab12cd34", 8) // 64 chars
+	wrapped := base64.StdEncoding.EncodeToString([]byte(realKey))
+	if len(realKey) != 64 || len(wrapped) != 88 {
+		t.Fatalf("fixture wrong: key=%d wrapped=%d, want 64 and 88", len(realKey), len(wrapped))
 	}
 
+	resp, err := makeOpenProjectRequest(context.Background(), http.MethodGet, srv.URL, wrapped, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// The UNWRAPPED key must reach the server. If the decode were removed, the wrapped
+	// value would be sent instead and OpenProject would answer 401 - which is exactly the
+	// production failure this behaviour prevents.
+	if want := "apikey:" + realKey; decodeBasic(t, gotAuth) != want {
+		t.Fatalf("credential sent = %q, want the DECODED key %q", decodeBasic(t, gotAuth), want)
+	}
+}
+
+// TestFunctionalRawKeyThatLooksLikeBase64 records the narrow hazard left by the decode
+// above: a raw key that is coincidentally valid base64 is decoded and therefore mangled.
+// This is a real edge case to respect when choosing how to store a key - store it wrapped,
+// as this deployment does - but it is NOT the cause of any observed incident.
+func TestFunctionalRawKeyThatLooksLikeBase64(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	lookalike := strings.Repeat("QUJD", 10) // valid base64, decodes to "ABC" x10
 	resp, err := makeOpenProjectRequest(context.Background(), http.MethodGet, srv.URL, lookalike, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	sent := decodeBasic(t, gotAuth)
-	asGiven := "apikey:" + lookalike
-	if sent == asGiven {
-		t.Fatalf("the key was sent unchanged (%q) - the base64 guessing has been removed, "+
-			"which is the desired fix; update this test", sent)
-	}
-	if want := "apikey:" + strings.Repeat("ABC", 10); sent != want {
-		t.Fatalf("expected the mangled credential %q, got %q", want, sent)
+	if want := "apikey:" + strings.Repeat("ABC", 10); decodeBasic(t, gotAuth) != want {
+		t.Fatalf("expected the decoded credential %q, got %q", want, decodeBasic(t, gotAuth))
 	}
 }
 
