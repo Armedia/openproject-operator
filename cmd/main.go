@@ -174,6 +174,7 @@ func main() {
 	if err = (&controller.WorkPackageReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Config: mgr.GetConfig(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkPackages")
 		os.Exit(1)
@@ -188,6 +189,7 @@ func main() {
 	if err = (&controller.CloudInventoryReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Config: mgr.GetConfig(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CloudInventory")
 		os.Exit(1)

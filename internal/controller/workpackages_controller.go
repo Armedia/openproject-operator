@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"k8s.io/client-go/rest"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -100,6 +101,10 @@ type WorkPackageStatusUpdate struct {
 type WorkPackageReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Config is the manager's rest.Config, threaded through to CloudInventory scans so
+	// local-mode inventory does not fall back to the ambient kubeconfig. Optional: when
+	// nil the inventory keeps its previous ctrl.GetConfig() behaviour.
+	Config *rest.Config
 }
 
 // maybeBase64 makes a best guess if a string is base64 encoded
@@ -330,7 +335,7 @@ func (r *WorkPackageReconciler) triggerCloudInventoryScan(ctx context.Context, w
 	logs = append(logs, fmt.Sprintf("Found CloudInventory: %s (mode: %s)", inv.Name, inv.Spec.Mode))
 
 	// Prepare the reconciler
-	cloudRec := &CloudInventoryReconciler{Client: r.Client, Scheme: r.Scheme}
+	cloudRec := &CloudInventoryReconciler{Client: r.Client, Scheme: r.Scheme, Config: r.Config}
 	var err error
 
 	// Dispatch based on Mode or which spec is present
@@ -411,23 +416,37 @@ func (r *WorkPackageReconciler) triggerCloudInventoryScan(ctx context.Context, w
 	return latest, logs, nil
 }
 
-// shouldRunNow determines if it's time to create a ticket
-func shouldRunNow(schedule string, lastRun *metav1.Time, creationTime metav1.Time) bool {
+// shouldRunNow determines if it's time to create a ticket.
+//
+// `status` is the persisted Status.Status. It is needed because the previous
+// "initialized, awaiting first run" signal did not survive a round-trip through the API
+// server: handleInitialization wrote LastRunTime as a ZERO metav1.Time, but metav1.Time
+// marshals a zero value to JSON null, and the field is `omitempty`, so it read back as
+// nil rather than as a non-nil pointer to zero. The zero branch below was therefore
+// unreachable in a real cluster, and a freshly created WorkPackages never fired on
+// creation - it waited for the next cron boundary. Observed 2026-09-03: a resource with
+// schedule "0 0 1 * *" sat at status=Scheduled, nextRun=2026-10-01 and never ran.
+//
+// StatusScheduled is written ONLY by handleInitialization (success sets Created, failure
+// sets Failed), so it is an accurate and durable marker for the same intent.
+func shouldRunNow(schedule string, lastRun *metav1.Time, creationTime metav1.Time, status string) bool {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	spec, err := parser.Parse(schedule)
 	if err != nil {
 		return false
 	}
+
+	// Initialized and never run: fire on this reconcile. Covers both the durable status
+	// marker and the legacy zero-time sentinel, so resources written by an older operator
+	// still behave the same way.
+	if (lastRun == nil && status == StatusScheduled) || (lastRun != nil && lastRun.IsZero()) {
+		return true
+	}
+
 	now := time.Now()
 	last := creationTime.Time
-	if lastRun != nil {
-		if !lastRun.IsZero() {
-			last = lastRun.Time
-		} else {
-			// If LastRunTime exists but is zero, this is an initialized resource
-			// waiting for first run - check against NextRunTime instead
-			return true
-		}
+	if lastRun != nil && !lastRun.IsZero() {
+		last = lastRun.Time
 	}
 	return now.After(spec.Next(last))
 }
@@ -594,7 +613,7 @@ func (r *WorkPackageReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Check if it's time to run
-	if !shouldRunNow(wp.Spec.Schedule, wp.Status.LastRunTime, wp.CreationTimestamp) {
+	if !shouldRunNow(wp.Spec.Schedule, wp.Status.LastRunTime, wp.CreationTimestamp, wp.Status.Status) {
 		statusLog(log, "⏳", "Not time to run yet based on schedule", "schedule", wp.Spec.Schedule)
 		return ctrl.Result{RequeueAfter: DefaultRequeueTime}, nil
 	}

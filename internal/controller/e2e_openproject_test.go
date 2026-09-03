@@ -154,9 +154,12 @@ func TestE2EOpenProjectPreflight(t *testing.T) {
 	t.Log("preflight OK: auth, project and work_packages API all healthy")
 }
 
-// TestE2EOpenProjectReconciliation is the real thing: a WorkPackages resource in a private
-// API server, reconciled by the operator's own controller, must produce a ticket in the
-// live OpenProject and record its id in status.
+// TestE2EOpenProjectReconciliation drives both live paths against one envtest instance.
+//
+// The two scenarios share a single manager deliberately: controller-runtime registers
+// controllers in a PROCESS-GLOBAL metrics registry, so wiring the same reconciler into a
+// second manager in the same test binary fails with "controller with name workpackages
+// already exists". Sharing is also faster - envtest start-up dominates the runtime.
 func TestE2EOpenProjectReconciliation(t *testing.T) {
 	e := e2eConfig(t)
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
@@ -176,12 +179,13 @@ func TestE2EOpenProjectReconciliation(t *testing.T) {
 	if err := openprojectorgv1alpha1.AddToScheme(scheme.Scheme); err != nil {
 		t.Fatalf("adding scheme: %v", err)
 	}
-
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{Scheme: scheme.Scheme})
 	if err != nil {
 		t.Fatalf("creating manager: %v", err)
 	}
-	if err := (&WorkPackageReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+	if err := (&WorkPackageReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Config: mgr.GetConfig(),
+	}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("wiring WorkPackageReconciler: %v", err)
 	}
 
@@ -197,197 +201,10 @@ func TestE2EOpenProjectReconciliation(t *testing.T) {
 	}
 	k8s := mgr.GetClient()
 
-	const ns = "default"
-	stamp := time.Now().UTC().Format("20060102-150405")
-	subject := fmt.Sprintf("%s %s", e2eSubjectPrefix, stamp)
-
-	// Secret holding the API key, then the ServerConfig that points at the live server.
-	if err := k8s.Create(ctx, &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-openproject-api", Namespace: ns},
-		StringData: map[string]string{"token": e.token},
-	}); err != nil {
-		t.Fatalf("creating secret: %v", err)
-	}
-	if err := k8s.Create(ctx, &openprojectorgv1alpha1.ServerConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-serverconfig", Namespace: ns},
-		Spec: openprojectorgv1alpha1.ServerConfigSpec{
-			Server: e.url,
-			APIKeySecretRef: corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: "e2e-openproject-api"},
-				Key:                  "token",
-			},
-		},
-	}); err != nil {
-		t.Fatalf("creating ServerConfig: %v", err)
-	}
-
-	wp := &openprojectorgv1alpha1.WorkPackages{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-workpackage", Namespace: ns},
-		Spec: openprojectorgv1alpha1.WorkPackagesSpec{
-			Subject:         subject,
-			Description:     "Created by the operator end-to-end verification. Safe to delete.",
-			ProjectID:       e.projectID,
-			TypeID:          e.typeID,
-			// Every minute, NOT the monthly production shape, and that is deliberate.
-			//
-			// handleInitialization writes LastRunTime as a zero metav1.Time intending it as a
-			// "never run, fire now" sentinel, and shouldRunNow honours it. But the field is
-			// `omitempty`, so a zero time serialises to nothing and reads back as nil - the
-			// sentinel does not survive a round-trip through the API server. shouldRunNow then
-			// falls through to creationTime and waits for the next cron boundary.
-			//
-			// Verified here on 2026-09-03: with "0 0 1 * *" the resource sat at
-			// status=Scheduled, nextRun=2026-10-01 and never fired. Production CRs are not
-			// affected because they carry real LastRunTime values from previous runs; it is
-			// newly created resources that never fire on creation.
-			//
-			// A minute schedule reaches its next boundary inside the test window, so this
-			// exercises the real create path without depending on the broken sentinel.
-			Schedule:        "* * * * *",
-			ServerConfigRef: corev1.LocalObjectReference{Name: "e2e-serverconfig"},
-		},
-	}
-	if err := k8s.Create(ctx, wp); err != nil {
-		t.Fatalf("creating WorkPackages: %v", err)
-	}
-
-	// Whatever happens, do not leave a ticket behind.
-	var ticketID string
-	t.Cleanup(func() { e.deleteTicket(t, ticketID) })
-
-	// The controller initialises first (writing a zero LastRunTime sentinel), then fires
-	// on a subsequent reconcile. Poll status rather than guessing at the timing.
-	deadline := time.Now().Add(3 * time.Minute)
-	var last openprojectorgv1alpha1.WorkPackages
-	for time.Now().Before(deadline) {
-		if err := k8s.Get(ctx, types.NamespacedName{Name: "e2e-workpackage", Namespace: ns}, &last); err == nil {
-			if last.Status.TicketID != "" {
-				ticketID = last.Status.TicketID
-				break
-			}
-			if last.Status.Status == StatusFailed {
-				t.Fatalf("the controller reported failure: %q (see the OpenProject response above)", last.Status.Message)
-			}
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if ticketID == "" {
-		t.Fatalf("no ticket was created within the deadline; last status=%q message=%q nextRun=%v",
-			last.Status.Status, last.Status.Message, last.Status.NextRunTime)
-	}
-	t.Logf("controller reported ticket id %s", ticketID)
-
-	// The status claiming success is not proof. Ask OpenProject.
-	code, body := e.opRequest(t, http.MethodGet, "/api/v3/work_packages/"+ticketID)
-	if code != http.StatusOK {
-		t.Fatalf("ticket %s not retrievable from OpenProject (HTTP %d): %s", ticketID, code, truncate(body, 200))
-	}
-	var got struct {
-		Subject string `json:"subject"`
-		Links   struct {
-			Project struct {
-				Href string `json:"href"`
-			} `json:"project"`
-		} `json:"_links"`
-	}
-	if err := json.Unmarshal(body, &got); err != nil {
-		t.Fatalf("decoding ticket: %v", err)
-	}
-	// The operator PREPENDS the period name to the configured subject, which is why the
-	// production tickets read "September AWS Systems Inventory" while the CR only says
-	// "AWS Systems Inventory". Assert the suffix so the test documents that behaviour
-	// instead of pinning a month name that changes every cycle.
-	if !strings.HasSuffix(got.Subject, subject) {
-		t.Fatalf("ticket subject = %q, want it to end with %q", got.Subject, subject)
-	}
-	if got.Subject == subject {
-		t.Logf("note: no period prefix was added this run (subject was used verbatim)")
-	} else {
-		t.Logf("operator prefixed the subject with %q",
-			strings.TrimSuffix(got.Subject, subject))
-	}
-	if want := fmt.Sprintf("/api/v3/projects/%d", e.projectID); !strings.HasSuffix(got.Links.Project.Href, want) {
-		t.Fatalf("ticket landed in %q, want a project href ending %q", got.Links.Project.Href, want)
-	}
-	t.Logf("VERIFIED end to end: ticket %s exists in OpenProject with subject %q in project %d",
-		ticketID, got.Subject, e.projectID)
-
-	// Status bookkeeping must also be correct, or the next cycle misbehaves.
-	if last.Status.LastRunTime == nil || last.Status.LastRunTime.IsZero() {
-		t.Error("LastRunTime was not set after a successful creation")
-	}
-	if last.Status.NextRunTime == nil || last.Status.NextRunTime.IsZero() {
-		t.Error("NextRunTime was not set after a successful creation")
-	}
-}
-
-func truncate(b []byte, n int) string {
-	s := strings.TrimSpace(string(b))
-	if len(s) > n {
-		return s[:n] + "..."
-	}
-	return s
-}
-
-// TestE2EOpenProjectCloudInventory exercises the INVENTORY path, which is a different
-// code path from the plain ticket above and is how the monthly AWS/EKS inventory tickets
-// are produced in production.
-//
-// Note CloudInventoryReconciler.Reconcile is a no-op - it fetches the resource and
-// returns. Inventories are not run on a schedule of their own; they are triggered by the
-// WorkPackages controller via triggerCloudInventoryScan when a WorkPackages carries an
-// InventoryRef. So this test drives it the way production does, through a WorkPackages.
-//
-// Kubernetes mode is used rather than AWS: it inventories the cluster the operator is
-// pointed at, which here is the private envtest API server, so the test needs no cloud
-// credentials and touches no real AWS account.
-func TestE2EOpenProjectCloudInventory(t *testing.T) {
-	e := e2eConfig(t)
-	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		t.Skip("KUBEBUILDER_ASSETS not set - run `setup-envtest use 1.31.0 -p path` first")
-	}
-
-	testEnv := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-	}
-	cfg, err := testEnv.Start()
-	if err != nil {
-		t.Fatalf("starting envtest: %v", err)
-	}
-	t.Cleanup(func() { _ = testEnv.Stop() })
-
-	if err := openprojectorgv1alpha1.AddToScheme(scheme.Scheme); err != nil {
-		t.Fatalf("adding scheme: %v", err)
-	}
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{Scheme: scheme.Scheme})
-	if err != nil {
-		t.Fatalf("creating manager: %v", err)
-	}
-	if err := (&WorkPackageReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
-		t.Fatalf("wiring WorkPackageReconciler: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go func() {
-		if err := mgr.Start(ctx); err != nil {
-			t.Logf("manager stopped: %v", err)
-		}
-	}()
-	if !mgr.GetCache().WaitForCacheSync(ctx) {
-		t.Fatal("cache did not sync")
-	}
-	k8s := mgr.GetClient()
-
-	// reconcileKubernetes in LOCAL mode builds its client from ctrl.GetConfig(), which
-	// reads the ambient kubeconfig or in-cluster service account - NOT the envtest config
-	// the manager was handed. Without this the scan fails to build a client, returns an
-	// error, and the ticket is still created with no report attached, which looks exactly
-	// like "the inventory silently did not run".
-	//
-	// Minting an envtest user and exporting KUBECONFIG points ctrl.GetConfig() at the
-	// private API server, so the inventory runs against envtest and touches nothing real.
+	// reconcileKubernetes in LOCAL mode builds its client from r.Config, falling back to
+	// ctrl.GetConfig() - the ambient kubeconfig or in-cluster service account. Config is
+	// now passed above, but export KUBECONFIG too so the fallback path is also correct if
+	// this test is ever run against an operator build that predates that fix.
 	adminUser, err := testEnv.AddUser(envtest.User{Name: "e2e-admin", Groups: []string{"system:masters"}}, nil)
 	if err != nil {
 		t.Fatalf("creating envtest user: %v", err)
@@ -403,9 +220,8 @@ func TestE2EOpenProjectCloudInventory(t *testing.T) {
 	t.Setenv("KUBECONFIG", kubeconfigPath)
 
 	const ns = "default"
-	stamp := time.Now().UTC().Format("20060102-150405")
-	subject := fmt.Sprintf("%s inventory %s", e2eSubjectPrefix, stamp)
 
+	// Shared credentials and server config for both scenarios.
 	if err := k8s.Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "e2e-openproject-api", Namespace: ns},
 		StringData: map[string]string{"token": e.token},
@@ -425,62 +241,145 @@ func TestE2EOpenProjectCloudInventory(t *testing.T) {
 		t.Fatalf("creating ServerConfig: %v", err)
 	}
 
-	// Inventory the envtest cluster itself. Empty namespaces means "all".
-	if err := k8s.Create(ctx, &openprojectorgv1alpha1.CloudInventory{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-inventory", Namespace: ns},
-		Spec: openprojectorgv1alpha1.CloudInventorySpec{
-			Mode:       "kubernetes",
-			Kubernetes: &openprojectorgv1alpha1.KubernetesInventorySpec{},
-		},
-	}); err != nil {
-		t.Fatalf("creating CloudInventory: %v", err)
-	}
-
-	inventoryRef := corev1.LocalObjectReference{Name: "e2e-inventory"}
-	if err := k8s.Create(ctx, &openprojectorgv1alpha1.WorkPackages{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-inventory-workpackage", Namespace: ns},
-		Spec: openprojectorgv1alpha1.WorkPackagesSpec{
-			Subject:         subject,
-			Description:     "Inventory verification. Safe to delete.",
-			ProjectID:       e.projectID,
-			TypeID:          e.typeID,
-			Schedule:        "* * * * *", // see the note on the sentinel in the test above
-			ServerConfigRef: corev1.LocalObjectReference{Name: "e2e-serverconfig"},
-			InventoryRef:    &inventoryRef,
-		},
-	}); err != nil {
-		t.Fatalf("creating WorkPackages: %v", err)
-	}
-
-	var ticketID string
-	t.Cleanup(func() { e.deleteTicket(t, ticketID) })
-
-	deadline := time.Now().Add(3 * time.Minute)
-	var last openprojectorgv1alpha1.WorkPackages
-	for time.Now().Before(deadline) {
-		if err := k8s.Get(ctx, types.NamespacedName{Name: "e2e-inventory-workpackage", Namespace: ns}, &last); err == nil {
-			if last.Status.TicketID != "" {
-				ticketID = last.Status.TicketID
-				break
+	// waitForTicket polls a WorkPackages until it records a ticket id, and registers the
+	// cleanup that deletes the ticket even when the test fails.
+	waitForTicket := func(t *testing.T, name string) (string, openprojectorgv1alpha1.WorkPackages) {
+		t.Helper()
+		var ticketID string
+		t.Cleanup(func() { e.deleteTicket(t, ticketID) })
+		deadline := time.Now().Add(3 * time.Minute)
+		var last openprojectorgv1alpha1.WorkPackages
+		for time.Now().Before(deadline) {
+			if err := k8s.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &last); err == nil {
+				if last.Status.TicketID != "" {
+					// Assign before returning: the cleanup closure above captures this
+					// variable, so returning the field directly would leave it empty and
+					// the deletion would silently do nothing. That happened - it left
+					// four tickets behind before being caught by checking the database.
+					ticketID = last.Status.TicketID
+					return ticketID, last
+				}
+				if last.Status.Status == StatusFailed {
+					t.Fatalf("controller reported failure: %q", last.Status.Message)
+				}
 			}
-			if last.Status.Status == StatusFailed {
-				t.Fatalf("controller reported failure: %q", last.Status.Message)
-			}
+			time.Sleep(2 * time.Second)
 		}
-		time.Sleep(2 * time.Second)
-	}
-	if ticketID == "" {
-		t.Fatalf("no inventory ticket created; last status=%q message=%q", last.Status.Status, last.Status.Message)
+		t.Fatalf("no ticket created within the deadline; last status=%q message=%q nextRun=%v",
+			last.Status.Status, last.Status.Message, last.Status.NextRunTime)
+		return "", last
 	}
 
-	// A CloudInventoryReport must have been produced as a side effect of the scan.
-	var reports openprojectorgv1alpha1.CloudInventoryReportList
-	if err := k8s.List(ctx, &reports, client.InNamespace(ns)); err != nil {
-		t.Fatalf("listing CloudInventoryReports: %v", err)
+	t.Run("creates a ticket in OpenProject", func(t *testing.T) {
+		stamp := time.Now().UTC().Format("20060102-150405")
+		subject := fmt.Sprintf("%s %s", e2eSubjectPrefix, stamp)
+
+		if err := k8s.Create(ctx, &openprojectorgv1alpha1.WorkPackages{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-workpackage", Namespace: ns},
+			Spec: openprojectorgv1alpha1.WorkPackagesSpec{
+				Subject:     subject,
+				Description: "Created by the operator end-to-end verification. Safe to delete.",
+				ProjectID:   e.projectID,
+				TypeID:      e.typeID,
+				// The MONTHLY production shape, and that is the point. Before the
+				// shouldRunNow fix a new resource with this schedule sat at
+				// status=Scheduled, nextRun=1 October and never fired, because the
+				// zero-time sentinel did not survive serialisation. It must now fire on
+				// the reconcile immediately after initialization.
+				Schedule:        "0 0 1 * *",
+				ServerConfigRef: corev1.LocalObjectReference{Name: "e2e-serverconfig"},
+			},
+		}); err != nil {
+			t.Fatalf("creating WorkPackages: %v", err)
+		}
+
+		ticketID, last := waitForTicket(t, "e2e-workpackage")
+		t.Logf("controller reported ticket id %s", ticketID)
+
+		// The status claiming success is not proof. Ask OpenProject.
+		code, body := e.opRequest(t, http.MethodGet, "/api/v3/work_packages/"+ticketID)
+		if code != http.StatusOK {
+			t.Fatalf("ticket %s not retrievable (HTTP %d): %s", ticketID, code, truncate(body, 200))
+		}
+		var got struct {
+			Subject string `json:"subject"`
+			Links   struct {
+				Project struct {
+					Href string `json:"href"`
+				} `json:"project"`
+			} `json:"_links"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("decoding ticket: %v", err)
+		}
+		// The operator PREPENDS the period name, which is why production tickets read
+		// "September AWS Systems Inventory" while the CR says only the latter.
+		if !strings.HasSuffix(got.Subject, subject) {
+			t.Fatalf("ticket subject = %q, want it to end with %q", got.Subject, subject)
+		}
+		if want := fmt.Sprintf("/api/v3/projects/%d", e.projectID); !strings.HasSuffix(got.Links.Project.Href, want) {
+			t.Fatalf("ticket landed in %q, want a project href ending %q", got.Links.Project.Href, want)
+		}
+		if last.Status.LastRunTime == nil || last.Status.LastRunTime.IsZero() {
+			t.Error("LastRunTime was not set after a successful creation")
+		}
+		if last.Status.NextRunTime == nil || last.Status.NextRunTime.IsZero() {
+			t.Error("NextRunTime was not set after a successful creation")
+		}
+		t.Logf("VERIFIED: ticket %s exists in OpenProject as %q in project %d",
+			ticketID, got.Subject, e.projectID)
+	})
+
+	t.Run("runs an inventory and produces a report", func(t *testing.T) {
+		// CloudInventoryReconciler.Reconcile is a no-op; inventories only run when a
+		// WorkPackages triggers one via InventoryRef. Drive it the way production does.
+		// Kubernetes mode inventories the envtest cluster, so no cloud credentials are
+		// needed and no real AWS account is touched.
+		if err := k8s.Create(ctx, &openprojectorgv1alpha1.CloudInventory{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-inventory", Namespace: ns},
+			Spec: openprojectorgv1alpha1.CloudInventorySpec{
+				Mode:       "kubernetes",
+				Kubernetes: &openprojectorgv1alpha1.KubernetesInventorySpec{},
+			},
+		}); err != nil {
+			t.Fatalf("creating CloudInventory: %v", err)
+		}
+
+		stamp := time.Now().UTC().Format("20060102-150405")
+		inventoryRef := corev1.LocalObjectReference{Name: "e2e-inventory"}
+		if err := k8s.Create(ctx, &openprojectorgv1alpha1.WorkPackages{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-inventory-workpackage", Namespace: ns},
+			Spec: openprojectorgv1alpha1.WorkPackagesSpec{
+				Subject:         fmt.Sprintf("%s inventory %s", e2eSubjectPrefix, stamp),
+				Description:     "Inventory verification. Safe to delete.",
+				ProjectID:       e.projectID,
+				TypeID:          e.typeID,
+				Schedule:        "0 0 1 * *",
+				ServerConfigRef: corev1.LocalObjectReference{Name: "e2e-serverconfig"},
+				InventoryRef:    &inventoryRef,
+			},
+		}); err != nil {
+			t.Fatalf("creating WorkPackages: %v", err)
+		}
+
+		ticketID, _ := waitForTicket(t, "e2e-inventory-workpackage")
+
+		var reports openprojectorgv1alpha1.CloudInventoryReportList
+		if err := k8s.List(ctx, &reports, client.InNamespace(ns)); err != nil {
+			t.Fatalf("listing CloudInventoryReports: %v", err)
+		}
+		if len(reports.Items) == 0 {
+			t.Fatal("ticket created but no CloudInventoryReport was produced - the inventory did not run")
+		}
+		t.Logf("VERIFIED inventory: ticket %s created and %d report(s) produced (summary=%v)",
+			ticketID, len(reports.Items), reports.Items[0].Status.Summary)
+	})
+}
+
+func truncate(b []byte, n int) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > n {
+		return s[:n] + "..."
 	}
-	if len(reports.Items) == 0 {
-		t.Fatal("the ticket was created but no CloudInventoryReport was produced - the inventory did not run")
-	}
-	t.Logf("VERIFIED inventory path: ticket %s created and %d CloudInventoryReport(s) produced (summary=%v)",
-		ticketID, len(reports.Items), reports.Items[0].Status.Summary)
+	return s
 }

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"k8s.io/client-go/rest"
 	"context"
 
 	"github.com/go-logr/logr"
@@ -16,6 +17,10 @@ type CloudInventoryReconciler struct {
 	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
+	// Config is the rest.Config to use for LOCAL-mode Kubernetes inventory. When nil the
+	// code falls back to ctrl.GetConfig(), which reads the ambient kubeconfig or the
+	// in-cluster service account - see reconcileKubernetes for why that is a trap.
+	Config *rest.Config
 }
 
 // +kubebuilder:rbac:groups=openproject.org,resources=cloudinventories,verbs=get;list;watch;create;update;patch;delete

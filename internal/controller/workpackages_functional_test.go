@@ -113,13 +113,13 @@ func TestFunctionalShouldRunNow(t *testing.T) {
 	justNow := metav1.NewTime(time.Now())
 
 	t.Run("due when the last run is long past", func(t *testing.T) {
-		if !shouldRunNow(monthlyFirstOfMonth, &longAgo, longAgo) {
+		if !shouldRunNow(monthlyFirstOfMonth, &longAgo, longAgo, StatusCreated) {
 			t.Fatal("expected due after 90 days on a monthly schedule")
 		}
 	})
 
 	t.Run("not due when it just ran", func(t *testing.T) {
-		if shouldRunNow(monthlyFirstOfMonth, &justNow, longAgo) {
+		if shouldRunNow(monthlyFirstOfMonth, &justNow, longAgo, StatusCreated) {
 			t.Fatal("expected not due immediately after a run")
 		}
 	})
@@ -129,19 +129,35 @@ func TestFunctionalShouldRunNow(t *testing.T) {
 	// WorkPackages would never fire.
 	t.Run("zero last-run sentinel means due", func(t *testing.T) {
 		zero := metav1.Time{}
-		if !shouldRunNow(monthlyFirstOfMonth, &zero, justNow) {
+		if !shouldRunNow(monthlyFirstOfMonth, &zero, justNow, StatusCreated) {
 			t.Fatal("expected the zero LastRunTime sentinel to be treated as due")
 		}
 	})
 
 	t.Run("falls back to creation time when never run", func(t *testing.T) {
-		if !shouldRunNow(monthlyFirstOfMonth, nil, longAgo) {
+		if !shouldRunNow(monthlyFirstOfMonth, nil, longAgo, StatusCreated) {
 			t.Fatal("expected due when never run and created long ago")
 		}
 	})
 
+	// The regression this replaces: handleInitialization used to signal "initialized,
+	// never run" with a zero LastRunTime, which serialises to null and reads back as nil,
+	// so the signal was lost and a new resource waited for the next cron boundary.
+	// StatusScheduled is written only by handleInitialization, so it is durable.
+	t.Run("initialized but never run is due, via the status marker", func(t *testing.T) {
+		if !shouldRunNow(monthlyFirstOfMonth, nil, justNow, StatusScheduled) {
+			t.Fatal("a freshly initialized resource must be due on the next reconcile")
+		}
+	})
+
+	t.Run("created recently with no last-run is not due", func(t *testing.T) {
+		if shouldRunNow(monthlyFirstOfMonth, nil, justNow, StatusCreated) {
+			t.Fatal("a resource that already ran must not re-fire immediately")
+		}
+	})
+
 	t.Run("invalid schedule never runs", func(t *testing.T) {
-		if shouldRunNow("not-a-cron", &longAgo, longAgo) {
+		if shouldRunNow("not-a-cron", &longAgo, longAgo, StatusCreated) {
 			t.Fatal("an unparseable schedule must not be treated as due")
 		}
 	})
